@@ -1,0 +1,324 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>AR Mural Web MVP</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #111; color: #fff; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+  #app { position: relative; width: 100vw; height: 100vh; overflow: hidden; }
+  #cam { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+  #overlay { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; }
+  #art { position: absolute; left: 0; top: 0; width: 40vw; height: auto; transform-origin: 0 0; display: none; pointer-events: auto; }
+  #ui { position: absolute; left: 0; right: 0; bottom: 0; padding: 12px; display: grid; gap: 8px; background: rgba(0,0,0,0.35); backdrop-filter: blur(4px); }
+  #ui > div { display: flex; gap: 8px; align-items: center; }
+  button, input[type=file], input[type=range] { font-size: 16px; padding: 8px 12px; border: 0; border-radius: 10px; background: #222; color: #fff; }
+  button.primary { background: #3355ff; }
+  label { font-size: 14px; }
+  #hint { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.4); padding: 8px 10px; border-radius: 8px; font-size: 13px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <video id="cam" autoplay playsinline muted></video>
+  <canvas id="overlay"></canvas>
+  <img id="art" alt="artwork">
+  <div id="hint">Tap to place. Pinch and rotate to adjust. Use lock to freeze.</div>
+  <div id="ui">
+    <div>
+      <input id="picker" type="file" accept="image/*">
+      <button id="lockBtn">Lock</button>
+      <label>Opacity <input id="opacity" type="range" min="0" max="1" step="0.01" value="0.9"></label>
+      <button id="snapBtn">Snapshot</button>
+    </div>
+  </div>
+</div>
+<script src="https://docs.opencv.org/4.x/opencv.js"></script>
+<script>
+const video = document.getElementById('cam');
+const overlay = document.getElementById('overlay');
+const octx = overlay.getContext('2d');
+const art = document.getElementById('art');
+const picker = document.getElementById('picker');
+const lockBtn = document.getElementById('lockBtn');
+const opacity = document.getElementById('opacity');
+const snapBtn = document.getElementById('snapBtn');
+
+let streamReady = false;
+let cvReady = false;
+let locked = false;
+let placing = false;
+let baseW = 0, baseH = 0;
+
+let prevGray = null;
+let currGray = null;
+let prevPts = null;
+let currPts = null;
+let haveTrack = false;
+let baseMatrix = [1,0,0,1,0,0];
+let liveMatrix = [1,0,0,1,0,0];
+
+function setArtTransform(m){
+  art.style.transform = `matrix(${m[0]}, ${m[1]}, ${m[2]}, ${m[3]}, ${m[4]}, ${m[5]})`;
+}
+
+function mulAffine(a,b){
+  return [
+    a[0]*b[0] + a[2]*b[1],
+    a[1]*b[0] + a[3]*b[1],
+    a[0]*b[2] + a[2]*b[3],
+    a[1]*b[2] + a[3]*b[3],
+    a[0]*b[4] + a[2]*b[5] + a[4],
+    a[1]*b[4] + a[3]*b[5] + a[5]
+  ];
+}
+
+async function initCam(){
+  try{
+    const s = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+    video.srcObject = s;
+    await video.play();
+    streamReady = true;
+    resize();
+    requestAnimationFrame(tick);
+  }catch(e){
+    alert('Camera permission needed');
+  }
+}
+
+function resize(){
+  overlay.width = video.clientWidth;
+  overlay.height = video.clientHeight;
+}
+
+window.addEventListener('resize', resize);
+
+picker.addEventListener('change', e => {
+  const file = e.target.files[0];
+  if(!file) return;
+  const url = URL.createObjectURL(file);
+  art.onload = () => {
+    baseW = Math.min(overlay.width * 0.5, art.naturalWidth);
+    baseH = art.naturalHeight * (baseW / art.naturalWidth);
+    art.width = baseW;
+    art.height = baseH;
+    art.style.opacity = opacity.value;
+    art.style.display = 'block';
+  };
+  art.src = url;
+});
+
+opacity.addEventListener('input', () => {
+  art.style.opacity = opacity.value;
+});
+
+lockBtn.addEventListener('click', () => {
+  locked = !locked;
+  lockBtn.textContent = locked ? 'Unlock' : 'Lock';
+});
+
+snapBtn.addEventListener('click', () => {
+  const out = document.createElement('canvas');
+  out.width = overlay.width;
+  out.height = overlay.height;
+  const c = out.getContext('2d');
+  c.drawImage(video, 0, 0, out.width, out.height);
+  c.save();
+  const m = liveMatrix;
+  c.setTransform(m[0], m[1], m[2], m[3], m[4], m[5]);
+  c.globalAlpha = parseFloat(opacity.value);
+  c.drawImage(art, 0, 0, baseW, baseH);
+  c.restore();
+  const a = out.toDataURL('image/png');
+  const link = document.createElement('a');
+  link.href = a;
+  link.download = 'mural_preview.png';
+  link.click();
+});
+
+function onTap(x, y){
+  if(!art.src) return;
+  const appRect = overlay.getBoundingClientRect();
+  const lx = x - appRect.left;
+  const ly = y - appRect.top;
+  baseMatrix = [1,0,0,1,lx,ly];
+  liveMatrix = baseMatrix.slice();
+  setArtTransform(liveMatrix);
+  startTracking();
+}
+
+overlay.addEventListener('click', e => {
+  if(locked) return;
+  onTap(e.clientX, e.clientY);
+});
+
+let touchState = null;
+function getTouchPos(t){
+  const r = overlay.getBoundingClientRect();
+  return { x: t.clientX - r.left, y: t.clientY - r.top };
+}
+
+overlay.addEventListener('touchstart', e => {
+  if(locked) return;
+  if(e.touches.length === 1){
+    const p = getTouchPos(e.touches[0]);
+    onTap(p.x + overlay.getBoundingClientRect().left, p.y + overlay.getBoundingClientRect().top);
+  }
+  if(e.touches.length === 2){
+    const p0 = getTouchPos(e.touches[0]);
+    const p1 = getTouchPos(e.touches[1]);
+    touchState = { p0, p1, base: liveMatrix.slice() };
+  }
+});
+
+overlay.addEventListener('touchmove', e => {
+  if(locked) return;
+  if(e.touches.length === 2 && touchState){
+    const q0 = getTouchPos(e.touches[0]);
+    const q1 = getTouchPos(e.touches[1]);
+    const v0x = touchState.p1.x - touchState.p0.x;
+    const v0y = touchState.p1.y - touchState.p0.y;
+    const v1x = q1.x - q0.x;
+    const v1y = q1.y - q0.y;
+    const len0 = Math.hypot(v0x, v0y) || 1;
+    const len1 = Math.hypot(v1x, v1y) || 1;
+    const s = len1 / len0;
+    const a0 = Math.atan2(v0y, v0x);
+    const a1 = Math.atan2(v1y, v1x);
+    const da = a1 - a0;
+    const cx = (q0.x + q1.x) * 0.5;
+    const cy = (q0.y + q1.y) * 0.5;
+    const cos = Math.cos(da);
+    const sin = Math.sin(da);
+    const T1 = [1,0,0,1,-cx,-cy];
+    const R = [cos,sin,-sin,cos,0,0];
+    const S = [s,0,0,s,0,0];
+    const T2 = [1,0,0,1,cx,cy];
+    liveMatrix = mulAffine(touchState.base, mulAffine(T1, mulAffine(S, mulAffine(R, T2))));
+    setArtTransform(liveMatrix);
+  }
+});
+
+overlay.addEventListener('touchend', e => { touchState = null; });
+
+function startTracking(){
+  try{
+    const w = video.videoWidth;
+    const h = video.videoHeight;
+    if(w === 0 || h === 0) return;
+    const tmp = document.createElement('canvas');
+    tmp.width = w; tmp.height = h;
+    const tctx = tmp.getContext('2d');
+    tctx.drawImage(video, 0, 0, w, h);
+    const frame = tctx.getImageData(0,0,w,h);
+
+    if(prevGray) prevGray.delete();
+    prevGray = new cv.Mat(h, w, cv.CV_8UC1);
+    currGray = new cv.Mat(h, w, cv.CV_8UC1);
+    const src = cv.matFromImageData(frame);
+    cv.cvtColor(src, prevGray, cv.COLOR_RGBA2GRAY);
+    src.delete();
+
+    const maxCorners = 200;
+    const quality = 0.01;
+    const minDist = 5;
+    const mask = new cv.Mat();
+    let pts = new cv.Mat();
+    cv.goodFeaturesToTrack(prevGray, pts, maxCorners, quality, minDist, mask, 3, false, 0.04);
+    mask.delete();
+
+    prevPts = new cv.Mat();
+    cv.cornerSubPix(prevGray, pts, new cv.Size(10,10), new cv.Size(-1,-1), new cv.TermCriteria(cv.TermCriteria_EPS | cv.TermCriteria_COUNT, 20, 0.03));
+    pts.convertTo(prevPts, cv.CV_32FC2);
+    pts.delete();
+    haveTrack = true;
+  }catch(err){
+    console.log(err);
+  }
+}
+
+function tick(){
+  requestAnimationFrame(tick);
+  if(!streamReady || !cvReady) return;
+  const w = video.videoWidth;
+  const h = video.videoHeight;
+  if(w === 0 || h === 0) return;
+  if(overlay.width !== video.clientWidth) resize();
+
+  octx.clearRect(0,0,overlay.width, overlay.height);
+
+  if(!haveTrack) return;
+
+  const tmp = document.createElement('canvas');
+  tmp.width = w; tmp.height = h;
+  const tctx = tmp.getContext('2d');
+  tctx.drawImage(video, 0, 0, w, h);
+  const frame = tctx.getImageData(0,0,w,h);
+
+  const src = cv.matFromImageData(frame);
+  cv.cvtColor(src, currGray, cv.COLOR_RGBA2GRAY);
+  src.delete();
+
+  let nextPts = new cv.Mat();
+  let status = new cv.Mat();
+  let err = new cv.Mat();
+  cv.calcOpticalFlowPyrLK(prevGray, currGray, prevPts, nextPts, status, err, new cv.Size(21,21), 3);
+
+  let p0 = [];
+  let p1 = [];
+  for(let i = 0; i < status.rows; i++){
+    if(status.data[i] === 1){
+      const x0 = prevPts.data32F[i*2];
+      const y0 = prevPts.data32F[i*2 + 1];
+      const x1 = nextPts.data32F[i*2];
+      const y1 = nextPts.data32F[i*2 + 1];
+      p0.push(x0, y0);
+      p1.push(x1, y1);
+    }
+  }
+
+  if(p0.length >= 6){
+    const m0 = cv.matFromArray(p0.length/2, 1, cv.CV_32FC2, p0);
+    const m1 = cv.matFromArray(p1.length/2, 1, cv.CV_32FC2, p1);
+    let aff = new cv.Mat();
+    const inliers = new cv.Mat();
+    aff = cv.estimateAffine2D(m0, m1, inliers, cv.RANSAC, 3, 2000, 0.99, 10);
+    if(!aff.empty()){
+      const a00 = aff.data64F[0];
+      const a01 = aff.data64F[1];
+      const a02 = aff.data64F[2];
+      const a10 = aff.data64F[3];
+      const a11 = aff.data64F[4];
+      const a12 = aff.data64F[5];
+      const camToViewX = overlay.width / w;
+      const camToViewY = overlay.height / h;
+      const A = [a00, a10, a01, a11, a02, a12];
+      const S = [camToViewX,0,0,camToViewY,0,0];
+      const Sm1 = [1/camToViewX,0,0,1/camToViewY,0,0];
+      const M = mulAffine(S, mulAffine(A, Sm1));
+      liveMatrix = mulAffine(M, baseMatrix);
+      if(!locked) setArtTransform(liveMatrix);
+    }
+    aff.delete(); inliers.delete(); m0.delete(); m1.delete();
+  }
+
+  prevGray.copyTo(prevGray);
+  currGray.copyTo(prevGray);
+  if(prevPts) prevPts.delete();
+  prevPts = nextPts;
+  status.delete(); err.delete();
+}
+
+function onOpenCvReady(){
+  cvReady = true;
+  initCam();
+}
+
+if(typeof cv === 'undefined'){
+  document.addEventListener('opencv_ready', onOpenCvReady);
+}else{
+  cv['onRuntimeInitialized'] = onOpenCvReady;
+}
+</script>
+</body>
+</html>
