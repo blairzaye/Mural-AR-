@@ -1,10 +1,10 @@
-// AR mural v2
+// AR mural v3 blob tracking
 <!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<title>AR Mural Web MVP v2</title>
+<title>AR Mural Web MVP v3 blob</title>
 <style>
   html, body { margin: 0; padding: 0; height: 100%; background: #111; color: #fff; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
   #app { position: relative; width: 100vw; height: 100vh; overflow: hidden; touch-action: none; }
@@ -13,9 +13,9 @@
   #art { position: absolute; left: 0; top: 0; width: 50vw; height: auto; transform-origin: 0 0; display: none; pointer-events: none; }
   #hint { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.45); padding: 8px 10px; border-radius: 8px; font-size: 13px; }
   #ui { position: absolute; right: 10px; top: 60px; display: flex; flex-direction: column; gap: 8px; padding: 10px; background: rgba(0,0,0,0.35); backdrop-filter: blur(4px); border-radius: 12px; }
-  #ui button, #ui input[type=file], #ui input[type=range] { font-size: 16px; padding: 10px 12px; border: 0; border-radius: 10px; background: #222; color: #fff; width: 200px; }
+  #ui button, #ui input[type=file], #ui input[type=range] { font-size: 16px; padding: 10px 12px; border: 0; border-radius: 10px; background: #222; color: #fff; width: 210px; }
   #ui label { font-size: 14px; display: flex; align-items: center; gap: 8px; }
-  #ui input[type=range] { width: 200px; }
+  #ui input[type=range] { width: 210px; }
 </style>
 </head>
 <body>
@@ -23,17 +23,19 @@
   <video id="cam" autoplay playsinline muted></video>
   <canvas id="overlay"></canvas>
   <img id="art" alt="artwork">
-  <div id="hint">Tap to place. One finger drag to move. Pinch to scale. Rotate with two fingers. Lock when happy. Snapshot saves a composite.</div>
+  <div id="hint">Load image then tap wall to place once. Tap marker to sample colour. Drag with one finger. Pinch to scale. Two finger rotate. Lock to freeze. Snapshot saves a composite.</div>
   <div id="ui">
       <input id="picker" type="file" accept="image/*">
+      <button id="sampleBtn">Sample colour</button>
       <button id="lockBtn">Lock</button>
       <label>Opacity <input id="opacity" type="range" min="0" max="1" step="0.01" value="0.9"></label>
       <button id="snapBtn">Snapshot</button>
   </div>
 </div>
+
 <script src="https://docs.opencv.org/4.x/opencv.js"></script>
 <script>
-// AR mural v2 marker inside script
+// v3 blob tracking marker in script
 
 const app = document.getElementById('app');
 const video = document.getElementById('cam');
@@ -41,6 +43,7 @@ const overlay = document.getElementById('overlay');
 const octx = overlay.getContext('2d');
 const art = document.getElementById('art');
 const picker = document.getElementById('picker');
+const sampleBtn = document.getElementById('sampleBtn');
 const lockBtn = document.getElementById('lockBtn');
 const opacity = document.getElementById('opacity');
 const snapBtn = document.getElementById('snapBtn');
@@ -48,26 +51,25 @@ const snapBtn = document.getElementById('snapBtn');
 let streamReady = false;
 let cvReady = false;
 let locked = false;
-let baseW = 0, baseH = 0;
 
-// gesture state
+let baseW = 0, baseH = 0;
+let baseMatrix = [1,0,0,1,0,0];
+let liveMatrix = [1,0,0,1,0,0];
+
 let isDragging = false;
 let dragStart = {x:0, y:0};
 let matrixAtDragStart = [1,0,0,1,0,0];
-let pinchStart = null; // {d, angle, cx, cy}
+let pinchStart = null;
 
-// tracking state
-let prevGray = null;
-let currGray = null;
-let prevPts = null;
-let haveTrack = false;
-let baseMatrix = [1,0,0,1,0,0];
-let liveMatrix = [1,0,0,1,0,0];
+let wantSample = false;
+let hsvTarget = null;
+let areaAtLock = null;
+
+let frameRGBA = null, frameHSV = null, mask = null, kernel = null;
 
 function setArtTransform(m){
   art.style.transform = `matrix(${m[0]}, ${m[1]}, ${m[2]}, ${m[3]}, ${m[4]}, ${m[5]})`;
 }
-
 function mulAffine(a,b){
   return [
     a[0]*b[0] + a[2]*b[1],
@@ -78,7 +80,6 @@ function mulAffine(a,b){
     a[1]*b[4] + a[3]*b[5] + a[5]
   ];
 }
-
 function translate(dx, dy){ return [1,0,0,1,dx,dy]; }
 function scaleAbout(s, cx, cy){ return mulAffine(translate(cx,cy), mulAffine([s,0,0,s,0,0], translate(-cx,-cy))); }
 function rotateAbout(a, cx, cy){ const c = Math.cos(a), s = Math.sin(a); return mulAffine(translate(cx,cy), mulAffine([c,s,-s,c,0,0], translate(-cx,-cy))); }
@@ -93,7 +94,6 @@ async function initCam(){
     requestAnimationFrame(tick);
   }catch(e){ alert('Camera permission needed'); }
 }
-
 function resize(){ overlay.width = app.clientWidth; overlay.height = app.clientHeight; }
 window.addEventListener('resize', resize);
 
@@ -108,9 +108,15 @@ picker.addEventListener('change', e => {
   };
   art.src = url;
 });
-
 opacity.addEventListener('input', () => { art.style.opacity = opacity.value; });
-lockBtn.addEventListener('click', () => { locked = !locked; lockBtn.textContent = locked ? 'Unlock' : 'Lock'; });
+
+lockBtn.addEventListener('click', () => {
+  locked = !locked;
+  lockBtn.textContent = locked ? 'Unlock' : 'Lock';
+  if(locked){
+    areaAtLock = null;
+  }
+});
 
 snapBtn.addEventListener('click', () => {
   const out = document.createElement('canvas');
@@ -127,14 +133,19 @@ snapBtn.addEventListener('click', () => {
   const link = document.createElement('a'); link.href = a; link.download = 'mural_preview.png'; link.click();
 });
 
-function clientToLocal(x, y){ const r = app.getBoundingClientRect(); return { x: x - r.left, y: y - r.top }; }
-function placeAt(x, y){ if(!art.src) return; baseMatrix = [1,0,0,1,x,y]; liveMatrix = baseMatrix.slice(); setArtTransform(liveMatrix); startTracking(); }
+sampleBtn.addEventListener('click', () => { wantSample = true; });
 
-// touch gestures
+function clientToLocal(x, y){ const r = app.getBoundingClientRect(); return { x: x - r.left, y: y - r.top }; }
+function placeAt(x, y){ if(!art.src) return; baseMatrix = [1,0,0,1,x,y]; liveMatrix = baseMatrix.slice(); setArtTransform(liveMatrix); }
+
 app.addEventListener('touchstart', e => {
-  if(locked) return;
   if(e.touches.length === 1){
     const p = clientToLocal(e.touches[0].clientX, e.touches[0].clientY);
+    if(wantSample){
+      sampleHSVAtClientPoint(p.x, p.y);
+      wantSample = false;
+      return;
+    }
     if(art.style.display !== 'block') return;
     if(baseMatrix[4] === 0 && baseMatrix[5] === 0){ placeAt(p.x, p.y); return; }
     isDragging = true; dragStart = p; matrixAtDragStart = liveMatrix.slice();
@@ -147,9 +158,7 @@ app.addEventListener('touchstart', e => {
     pinchStart = { d, angle, cx, cy }; matrixAtDragStart = liveMatrix.slice();
   }
 });
-
 app.addEventListener('touchmove', e => {
-  if(locked) return;
   if(e.touches.length === 1 && isDragging){
     const p = clientToLocal(e.touches[0].clientX, e.touches[0].clientY);
     const dx = p.x - dragStart.x; const dy = p.y - dragStart.y;
@@ -167,11 +176,121 @@ app.addEventListener('touchmove', e => {
 });
 app.addEventListener('touchend', () => { isDragging = false; pinchStart = null; });
 
-// tracking (simplified, unchanged logic)
-function startTracking(){ /* left as in previous version */ }
-function tick(){ requestAnimationFrame(tick); if(!streamReady || !cvReady) return; }
+// mouse support for desktop test
+app.addEventListener('mousedown', e => {
+  const p = clientToLocal(e.clientX, e.clientY);
+  if(wantSample){ sampleHSVAtClientPoint(p.x, p.y); wantSample = false; return; }
+  if(art.style.display !== 'block') return;
+  if(baseMatrix[4] === 0 && baseMatrix[5] === 0){ placeAt(p.x, p.y); return; }
+  isDragging = true; dragStart = p; matrixAtDragStart = liveMatrix.slice();
+});
+window.addEventListener('mousemove', e => {
+  if(!isDragging) return;
+  const p = clientToLocal(e.clientX, e.clientY);
+  const dx = p.x - dragStart.x; const dy = p.y - dragStart.y;
+  liveMatrix = mulAffine(translate(dx, dy), matrixAtDragStart); setArtTransform(liveMatrix);
+});
+window.addEventListener('mouseup', () => { isDragging = false; });
+
+function sampleHSVAtClientPoint(xView, yView){
+  if(!frameRGBA || frameRGBA.cols === 0) return;
+  const rx = Math.round(xView * frameRGBA.cols / overlay.width);
+  const ry = Math.round(yView * frameRGBA.rows / overlay.height);
+  const idx = (ry * frameRGBA.cols + rx) * 4;
+  const r = frameRGBA.data[idx], g = frameRGBA.data[idx+1], b = frameRGBA.data[idx+2];
+  const tmp = new cv.Mat(1,1,cv.CV_8UC3);
+  tmp.data[0] = r; tmp.data[1] = g; tmp.data[2] = b;
+  const tmpHSV = new cv.Mat();
+  cv.cvtColor(tmp, tmpHSV, cv.COLOR_RGB2HSV);
+  const H = tmpHSV.data[0], S = tmpHSV.data[1], V = tmpHSV.data[2];
+  tmp.delete(); tmpHSV.delete();
+  hsvTarget = {H, S, V};
+}
+
+function tick(){
+  requestAnimationFrame(tick);
+  if(!streamReady || !cvReady) return;
+
+  const w = video.videoWidth, h = video.videoHeight;
+  if(!w || !h) return;
+
+  if(overlay.width !== app.clientWidth) resize();
+
+  // lazy allocate mats
+  if(!frameRGBA){ frameRGBA = new cv.Mat(h, w, cv.CV_8UC4); }
+  if(!frameHSV){ frameHSV = new cv.Mat(h, w, cv.CV_8UC3); }
+  if(!mask){ mask = new cv.Mat(h, w, cv.CV_8UC1); }
+  if(!kernel){ kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(5,5)); }
+
+  // read frame
+  const tmp = document.createElement('canvas');
+  tmp.width = w; tmp.height = h;
+  const tctx = tmp.getContext('2d');
+  tctx.drawImage(video, 0, 0, w, h);
+  const frame = tctx.getImageData(0,0,w,h);
+  frameRGBA.data.set(frame.data);
+
+  // convert to hsv
+  cv.cvtColor(frameRGBA, frameHSV, cv.COLOR_RGBA2RGB);
+  cv.cvtColor(frameHSV, frameHSV, cv.COLOR_RGB2HSV);
+
+  octx.clearRect(0,0,overlay.width, overlay.height);
+
+  if(hsvTarget && !locked){
+    // range around sampled hsv
+    const dh = 12, ds = 60, dv = 60;
+    const lower = new cv.Mat(frameHSV.rows, frameHSV.cols, frameHSV.type(), [Math.max(0, hsvTarget.H - dh), Math.max(0, hsvTarget.S - ds), Math.max(0, hsvTarget.V - dv), 0]);
+    const upper = new cv.Mat(frameHSV.rows, frameHSV.cols, frameHSV.type(), [Math.min(179, hsvTarget.H + dh), Math.min(255, hsvTarget.S + ds), Math.min(255, hsvTarget.V + dv), 0]);
+    cv.inRange(frameHSV, lower, upper, mask);
+    lower.delete(); upper.delete();
+
+    // clean mask
+    cv.morphologyEx(mask, mask, cv.MORPH_OPEN, kernel);
+    cv.morphologyEx(mask, mask, cv.MORPH_CLOSE, kernel);
+
+    // find largest contour
+    const contours = new cv.MatVector();
+    const hierarchy = new cv.Mat();
+    cv.findContours(mask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+    hierarchy.delete();
+
+    let bestArea = 0, bestCnt = null;
+    for(let i=0; i<contours.size(); i++){
+      const cnt = contours.get(i);
+      const area = cv.contourArea(cnt);
+      if(area > bestArea){ bestArea = area; bestCnt = cnt; }
+    }
+
+    if(bestCnt && bestArea > 80){
+      const M = cv.moments(bestCnt);
+      if(M.m00 !== 0){
+        const cx = M.m10 / M.m00;
+        const cy = M.m01 / M.m00;
+
+        const vx = cx * overlay.width / w;
+        const vy = cy * overlay.height / h;
+
+        // draw debug dot
+        octx.beginPath(); octx.arc(vx, vy, 6, 0, Math.PI*2); octx.strokeStyle = "#00ff99"; octx.lineWidth = 2; octx.stroke();
+
+        // set scale relative to blob area
+        const radius = Math.sqrt(bestArea / Math.PI);
+        if(areaAtLock == null) areaAtLock = radius;
+
+        const s = Math.max(0.2, Math.min(4.0, radius / areaAtLock));
+        const S = scaleAbout(s, vx, vy);
+        const T = translate(vx, vy);
+        liveMatrix = mulAffine(S, [1,0,0,1,-baseW*0.5,-baseH*0.5]);
+        liveMatrix = mulAffine(T, liveMatrix);
+        setArtTransform(liveMatrix);
+      }
+    }
+    contours.delete();
+  }
+}
+
 function onOpenCvReady(){ cvReady = true; initCam(); }
-cv['onRuntimeInitialized'] = onOpenCvReady;
+cv.onRuntimeInitialized = onOpenCvReady;
 </script>
 </body>
 </html>
